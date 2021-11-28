@@ -25,38 +25,22 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func assertErrors(t *testing.T, e <-chan error) func() {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-
-		for err := range e {
-			assert.NoError(t, err)
-		}
-	}()
-
-	return func() {
-		<-done
-	}
-}
 
 func Test_Run(t *testing.T) {
 	t.Run("Generate", func(t *testing.T) {
 		ensureTestCase(t, "T1", 64, 128, "colA", "edgeA")
 		ensureTestCase(t, "T2", 1024*128, 1024*128*2, "colA", "edgeA")
 		ensureTestCase(t, "T3", 1024*1024, 1024*1024*2, "colA", "edgeA")
-		//ensureTestCase(t, "T4", 16*1024*1024, 8*1024*1024, "colA", "edgeA")
+		ensureTestCase(t, "T4", 16*1024*1024, 8*1024*1024, "colA", "edgeA")
 	})
 
 	t.Run("Execute", func(t *testing.T) {
 		runExecution(t, "T1")
 		runExecution(t, "T2")
 		runExecution(t, "T3")
-		//runExecution(t, "T4")
+		runExecution(t, "T4")
 	})
 }
 

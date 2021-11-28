@@ -22,7 +22,6 @@ package optimizer
 
 import (
 	"os"
-	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
@@ -37,7 +36,9 @@ func CLI() *cobra.Command {
 
 type cli struct {
 	threads int
-	Batch   int
+batch       int
+
+	logLevel string
 
 	extractVertexesArgs struct {
 		In, Out string
@@ -127,8 +128,9 @@ func (c *cli) Command() *cobra.Command {
 
 	f = cmd.PersistentFlags()
 
-	f.IntVar(&c.threads, "threads", 4, "Threads")
-	f.IntVar(&c.Batch, "batch", 1024*1024*32, "Batch size")
+	f.IntVar(&c.threads, "threads", 12, "Threads")
+	f.IntVar(&c.batch, "batch", 1024*1024*32, "Batch size")
+	f.StringVar(&c.logLevel, "log-level", "info", "Define log level")
 
 	cmd.AddCommand(extractVertexes, extractEdges, mapEdges, optimize, translate)
 
@@ -164,10 +166,7 @@ func (c *cli) extractVertexes(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	p := NewProgress(5*time.Second, WithName(logger.Info))
-	defer p.Done()
-
-	for err := range ExtractVertexFromDocuments(p, inF, outF, c.Batch, c.threads) {
+	for err := range ExtractVertexFromDocuments(inF, outF, c.threads) {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to parse data")
@@ -209,10 +208,7 @@ func (c *cli) extractEdges(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	p := NewProgress(5*time.Second, WithName(logger.Info))
-	defer p.Done()
-
-	for err := range ExtractEdgeVertexFromEdge(p, inF, outF, c.Batch, c.threads) {
+	for err := range ExtractEdgeVertexFromEdge(inF, outF, c.threads) {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to parse data")
@@ -256,10 +252,7 @@ func (c *cli) mapEdges(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	p := NewProgress(5*time.Second, WithName(logger.Info))
-	defer p.Done()
-
-	for err := range MapVertexesAndEdges(p, inF, c.mapEdgesArgs.Edges, c.mapEdgesArgs.TempA, c.mapEdgesArgs.TempB, c.mapEdgesArgs.Out, c.Batch, c.threads) {
+	for err := range MapVertexesAndEdges(inF, c.mapEdgesArgs.Edges, c.mapEdgesArgs.TempA, c.mapEdgesArgs.TempB, c.mapEdgesArgs.Out, c.batch, c.threads) {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to map data")
@@ -301,10 +294,7 @@ func (c *cli) optimize(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	p := NewProgress(5*time.Second, WithName(logger.Info))
-	defer p.Done()
-
-	for err := range RunOptimization(p, inF, outF, c.Batch, c.threads) {
+	for err := range RunOptimization(inF, outF, c.batch) {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to run optimizer")
@@ -386,10 +376,7 @@ func (c *cli) translate(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	p := NewProgress(5*time.Second, WithName(logger.Info))
-	defer p.Done()
-
-	for err := range RunTranslation(p, mapInF, vertexesInF, edgesInF, edgeMapIn, vertexesOutF, edgesOutF, c.Batch, c.threads) {
+	for err := range RunTranslation(mapInF, vertexesInF, edgesInF, edgeMapIn, vertexesOutF, edgesOutF, c.threads) {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to run translator")
@@ -403,7 +390,12 @@ func (c *cli) translate(cmd *cobra.Command, args []string) error {
 }
 
 func (c *cli) getLogger(cmd *cobra.Command) zerolog.Logger {
-	return zerolog.New(cmd.OutOrStdout()).With().Timestamp().Logger()
+	level, err := zerolog.ParseLevel(c.logLevel)
+	if err != nil {
+		level = zerolog.InfoLevel
+	}
+
+	return zerolog.New(cmd.OutOrStdout()).Level(level).With().Timestamp().Logger()
 }
 
 func (c *cli) markAsRequired(set bool, message string, args ...interface{}) error {

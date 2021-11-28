@@ -27,7 +27,7 @@ import (
 	"strconv"
 )
 
-func MapVertexesAndEdges(p Progress, vertexes io.Reader, in, tmpA, tmpB, out string, buffer int, threads int) <-chan error {
+func MapVertexesAndEdges(vertexes io.Reader, in, tmpA, tmpB, out string, maxSize, threads int) <-chan error {
 	errs := make(chan error)
 
 	go func() {
@@ -35,23 +35,44 @@ func MapVertexesAndEdges(p Progress, vertexes io.Reader, in, tmpA, tmpB, out str
 
 		last, next := in, tmpA
 
-		vertexes, verr := ReadVertex(p, vertexes, buffer)
+		vertexes, verr := ReadVertex(vertexes)
 		go PushErrors(verr, errs)()
 
-		for m := range vertexToMap(vertexes) {
+		offset := 0
+		mapping := map[string]int{}
 
-			if err := mapVertexesBatch(p, errs, m, last, next, buffer/512, threads); err != nil {
-				errs <- err
+		for {
+			vtx, ok := <-vertexes
+			if !ok {
+				if len(mapping)==0 {
+					break
+				}
 			}
 
-			if next == tmpA {
-				last, next = tmpA, tmpB
-			} else {
-				last, next = tmpB, tmpA
+			if ok {
+				for id := range vtx {
+					mapping[string(vtx[id])] = id + offset
+				}
+
+				offset += len(vtx)
+			}
+
+			if len(mapping) > maxSize || !ok {
+				if err := mapVertexesBatch(errs, mapping, last, next, threads); err != nil {
+					errs <- err
+				}
+
+				mapping = map[string]int{}
+
+				if next == tmpA {
+					last, next = tmpA, tmpB
+				} else {
+					last, next = tmpB, tmpA
+				}
 			}
 		}
 
-		if err := mapEdgesToInt(p, errs, last, out); err != nil {
+		if err := mapEdgesToInt(errs, last, out); err != nil {
 			errs <- err
 		}
 	}()
@@ -59,30 +80,7 @@ func MapVertexesAndEdges(p Progress, vertexes io.Reader, in, tmpA, tmpB, out str
 	return errs
 }
 
-func vertexToMap(in <-chan []Vertex) <-chan map[string]int {
-	out := make(chan map[string]int, 4)
-
-	go func() {
-		defer close(out)
-
-		offset := 0
-
-		for v := range in {
-			m := map[string]int{}
-			for id := range v {
-				m[string(v[id])] = id + offset
-			}
-
-			offset += len(v)
-
-			out <- m
-		}
-	}()
-
-	return out
-}
-
-func mapVertexesBatch(p Progress, errs chan<- error, s map[string]int, in, out string, batchPerThread, threads int) error {
+func mapVertexesBatch(errs chan<- error, s map[string]int, in, out string, threads int) error {
 	fin, err := os.OpenFile(in, os.O_RDONLY, 0644)
 	if err != nil {
 		return err
@@ -97,11 +95,11 @@ func mapVertexesBatch(p Progress, errs chan<- error, s map[string]int, in, out s
 
 	defer fout.Close()
 
-	din, derr := ReadNL(p, fin, batchPerThread*threads)
+	din, derr := ReadNL(fin)
 	defer PushErrors(derr, errs)()
 
 	dout := make(chan [][]byte, 4)
-	defer PushErrors(WriteNL(p, fout, dout), errs)()
+	defer PushErrors(WriteNL(fout, dout), errs)()
 
 	for d := range din {
 		r := make([][]byte, len(d))
@@ -129,7 +127,7 @@ func mapVertexesBatch(p Progress, errs chan<- error, s map[string]int, in, out s
 	return nil
 }
 
-func mapEdgesToInt(p Progress, errs chan<- error, in, out string) error {
+func mapEdgesToInt(errs chan<- error, in, out string) error {
 	fin, err := os.OpenFile(in, os.O_RDONLY, 0644)
 	if err != nil {
 		return err
@@ -144,11 +142,11 @@ func mapEdgesToInt(p Progress, errs chan<- error, in, out string) error {
 
 	defer fout.Close()
 
-	din, derr := ReadNL(p, fin, 16*1024)
+	din, derr := ReadNL(fin)
 	defer PushErrors(derr, errs)()
 
 	dout := make(chan [][]byte)
-	defer PushErrors(Write(p, fout, dout), errs)()
+	defer PushErrors(Write(fout, dout), errs)()
 
 	for d := range din {
 		r := make([][]byte, len(d))

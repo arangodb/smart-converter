@@ -29,143 +29,158 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 type Mapping struct {
 	A, B int64
 }
 
-func RunTranslation(p Progress, optimized, vertexes, edges, edgeMap io.Reader, vertexesOut, edgesOut io.Writer, buffer, threads int) <-chan error {
+func RunTranslation(optimized, vertexes, edges, edgeMap io.Reader, vertexesOut, edgesOut io.Writer, threads int) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
 
-		m := GetMapping(p, errs, optimized, buffer)
+		m := GetMapping(errs, optimized)
 
 		index := 0
 
-		// Lets run over vertexes
-		vertexesIn, verr := ReadNL(p, vertexes, buffer)
-		defer PushErrors(verr, errs)()
+		var wg sync.WaitGroup
 
-		outData := make(chan [][]byte)
-		defer PushErrors(WriteNL(p, vertexesOut, outData), errs)()
+		wg.Add(2)
 
-		for v := range vertexesIn {
-			out := make([][]byte, len(v))
-			RunInThread(threads, len(v), func(id int) {
-				var q map[string]interface{}
+		go func() {
+			defer wg.Done()
 
-				if err := json.Unmarshal(v[id], &q); err != nil {
-					errs <- err
-					return
-				}
+			// Lets run over vertexes
+			vertexesIn, verr := ReadNL(vertexes)
+			defer PushErrors(verr, errs)()
 
-				key, ok := q["_key"]
+			outData := make(chan [][]byte)
+			defer PushErrors(WriteNL(vertexesOut, outData), errs)()
+
+			for v := range vertexesIn {
+				out := make([][]byte, len(v))
+				RunInThread(threads, len(v), func(id int) {
+					var q map[string]interface{}
+
+					if err := json.Unmarshal(v[id], &q); err != nil {
+						errs <- err
+						return
+					}
+
+					key, ok := q["_key"]
+					if !ok {
+						errs <- errors.New("missing _key attribute")
+					}
+
+					q["serial_number"] = key
+
+					weight := int64(index + id)
+					if index+id < len(m) {
+						weight = m[index+id].A
+					}
+
+					q["smart"] = fmt.Sprintf("%d", weight)
+					q["_key"] = fmt.Sprintf("%d:%s", weight, key)
+
+					delete(q, "_rev")
+					delete(q, "_id")
+
+					if d, err := json.Marshal(q); err != nil {
+						errs <- err
+					} else {
+						out[id] = d
+					}
+				})
+
+				outData <- out
+				index += len(v)
+			}
+
+			close(outData)
+		}()
+
+
+		go func() {
+			defer wg.Done()
+
+			// Iterate over edges
+			eOut, eErr := ReadMapping(edgeMap)
+			PushErrors(eErr, errs)
+
+			outData := make(chan [][]byte)
+			defer PushErrors(WriteNL(edgesOut, outData), errs)()
+
+			edgesIn, verr := ReadNL(edges)
+			defer PushErrors(verr, errs)()
+
+			for v := range edgesIn {
+				edgeMap, ok := <-eOut
 				if !ok {
-					errs <- errors.New("missing _key attribute")
+					panic("")
 				}
 
-				q["serial_number"] = key
-
-				weight := int64(index + id)
-				if index+id < len(m) {
-					weight = m[index+id].A
+				if len(v) != len(edgeMap) {
+					panic("")
 				}
 
-				q["smart"] = fmt.Sprintf("%d", weight)
-				q["_key"] = fmt.Sprintf("%d:%s", weight, key)
+				out := make([][]byte, len(v))
+				RunInThread(threads, len(v), func(id int) {
+					var q map[string]interface{}
 
-				delete(q, "_rev")
-				delete(q, "_id")
+					if err := json.Unmarshal(v[id], &q); err != nil {
+						errs <- err
+						return
+					}
+					delete(q, "_rev")
+					delete(q, "_id")
+					delete(q, "_key")
 
-				if d, err := json.Marshal(q); err != nil {
-					errs <- err
-				} else {
-					out[id] = d
-				}
-			})
-
-			outData <- out
-			index += len(v)
-		}
-
-		close(outData)
-
-		// Iterate over edges
-
-		eOut, eErr := ReadMapping(p, edgeMap, buffer)
-		PushErrors(eErr, errs)
-
-		outData = make(chan [][]byte)
-		defer PushErrors(WriteNL(p, edgesOut, outData), errs)()
-
-		edgesIn, verr := ReadNL(p, edges, buffer)
-		defer PushErrors(verr, errs)()
-
-		for v := range edgesIn {
-			edgeMap, ok := <-eOut
-			if !ok {
-				panic("")
-			}
-
-			if len(v) != len(edgeMap) {
-				panic("")
-			}
-
-			out := make([][]byte, len(v))
-			RunInThread(threads, len(v), func(id int) {
-				var q map[string]interface{}
-
-				if err := json.Unmarshal(v[id], &q); err != nil {
-					errs <- err
-					return
-				}
-				delete(q, "_rev")
-				delete(q, "_id")
-				delete(q, "_key")
-
-				if from, ok := q["_from"]; ok {
-					if s, ok := from.(string); ok {
-						parts := strings.Split(s, "/")
-						if len(parts) == 2 {
-							q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].A].A, parts[1])
+					if from, ok := q["_from"]; ok {
+						if s, ok := from.(string); ok {
+							parts := strings.Split(s, "/")
+							if len(parts) == 2 {
+								q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].A].A, parts[1])
+							}
 						}
 					}
-				}
 
-				if from, ok := q["_to"]; ok {
-					if s, ok := from.(string); ok {
-						parts := strings.Split(s, "/")
-						if len(parts) == 2 {
-							q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].B].A, parts[1])
+					if from, ok := q["_to"]; ok {
+						if s, ok := from.(string); ok {
+							parts := strings.Split(s, "/")
+							if len(parts) == 2 {
+								q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].B].A, parts[1])
+							}
 						}
 					}
-				}
 
-				if d, err := json.Marshal(q); err != nil {
-					errs <- err
-				} else {
-					out[id] = d
-				}
-			})
-			outData <- out
-		}
+					if d, err := json.Marshal(q); err != nil {
+						errs <- err
+					} else {
+						out[id] = d
+					}
+				})
+				outData <- out
+			}
 
-		close(outData)
+			close(outData)
+		}()
+
+		wg.Wait()
 	}()
 
 	return errs
 }
 
-func RunOptimization(p Progress, in *os.File, out io.Writer, buffer, threads int) <-chan error {
+func RunOptimization(in *os.File, out io.Writer, buffer int) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
 
-		m, merr := ReadMapping(p, in, buffer)
+		m, merr := ReadMapping(in)
 		defer PushErrors(merr, errs)()
 
 		max := int64(0)
@@ -189,7 +204,7 @@ func RunOptimization(p Progress, in *os.File, out io.Writer, buffer, threads int
 				break
 			}
 
-			m, merr := ReadMapping(p, in, buffer)
+			m, merr := ReadMapping(in)
 			defer PushErrors(merr, errs)()
 
 			changed := 0
@@ -220,7 +235,7 @@ func RunOptimization(p Progress, in *os.File, out io.Writer, buffer, threads int
 		}
 
 		data := make(chan []Mapping)
-		defer PushErrors(WriteMapping(p, out, data, buffer), errs)()
+		defer PushErrors(WriteMapping(out, data, buffer), errs)()
 
 		for id := 0; id < len(state); id += buffer {
 			if id+buffer > len(state) {
@@ -247,14 +262,14 @@ func GenerateMapping(size int64) []Mapping {
 	return q
 }
 
-func WriteMapping(p Progress, out io.Writer, in <-chan []Mapping, buffer int) <-chan error {
+func WriteMapping(out io.Writer, in <-chan []Mapping, buffer int) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
 
 		data := make(chan [][]byte, buffer)
-		defer PushErrors(Write(p, out, data), errs)()
+		defer PushErrors(Write(out, data), errs)()
 
 		for q := range in {
 			z := make([][]byte, len(q))
@@ -267,7 +282,7 @@ func WriteMapping(p Progress, out io.Writer, in <-chan []Mapping, buffer int) <-
 
 				z[id] = i
 			}
-			p.Job("WRITE_MAPPING").Add(len(z))
+
 			data <- z
 		}
 
@@ -278,10 +293,10 @@ func WriteMapping(p Progress, out io.Writer, in <-chan []Mapping, buffer int) <-
 	return errs
 }
 
-func GetMapping(p Progress, errs chan<- error, in io.Reader, buffer int) []Mapping {
+func GetMapping(errs chan<- error, in io.Reader) []Mapping {
 	var m []Mapping
 
-	mc, e := ReadMapping(p, in, buffer)
+	mc, e := ReadMapping(in)
 	defer PushErrors(e, errs)()
 
 	for q := range mc {
@@ -291,7 +306,7 @@ func GetMapping(p Progress, errs chan<- error, in io.Reader, buffer int) []Mappi
 	return m
 }
 
-func ReadMapping(p Progress, in io.Reader, buffer int) (<-chan []Mapping, <-chan error) {
+func ReadMapping(in io.Reader) (<-chan []Mapping, <-chan error) {
 	errs := make(chan error, 32)
 	mappings := make(chan []Mapping)
 
@@ -301,7 +316,7 @@ func ReadMapping(p Progress, in io.Reader, buffer int) (<-chan []Mapping, <-chan
 
 		scanner := bufio.NewReaderSize(in, 4*1024*1024)
 
-		m := make([]Mapping, buffer)
+		m := make([]Mapping, IOBufferSize)
 		id := 0
 
 		b := make([]byte, 16)
@@ -338,17 +353,15 @@ func ReadMapping(p Progress, in io.Reader, buffer int) (<-chan []Mapping, <-chan
 
 			id++
 
-			if id == buffer {
+			if id == IOBufferSize {
 				mappings <- m
-				p.Job("MAPPING_READ").Add(len(m))
 
-				m = make([]Mapping, buffer)
+				m = make([]Mapping, IOBufferSize)
 				id = 0
 			}
 		}
 
 		if id > 0 {
-			p.Job("MAPPING_READ").Add(id)
 			mappings <- m[0:id]
 		}
 	}()

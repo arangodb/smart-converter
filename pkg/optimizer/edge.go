@@ -30,7 +30,7 @@ type EdgeDocument struct {
 	To   Vertex `json:"_to"`
 }
 
-func ReadEdgesFromEdgeDocuments(p Progress, reader io.Reader, buffer, threads int) (<-chan []EdgeVertex, <-chan error) {
+func ReadEdgesFromEdgeDocuments(reader io.Reader, threads int) (<-chan []EdgeVertex, <-chan error) {
 	docs := make(chan []EdgeVertex)
 	errs := make(chan error, 32)
 
@@ -38,7 +38,7 @@ func ReadEdgesFromEdgeDocuments(p Progress, reader io.Reader, buffer, threads in
 		defer close(docs)
 		defer close(errs)
 
-		din, ein := ReadJSON(p, reader, buffer, threads, func(bytes []byte) (interface{}, error) {
+		din, ein := ReadJSON(reader, threads, func(bytes []byte) (interface{}, error) {
 			var v EdgeDocument
 
 			if err := json.Unmarshal(bytes, &v); err != nil {
@@ -65,8 +65,6 @@ func ReadEdgesFromEdgeDocuments(p Progress, reader io.Reader, buffer, threads in
 					q[id] = v
 				}
 			}
-
-			p.Job("READ_EDGE_VERTEX_D").Add(len(q))
 
 			docs <- q
 		}

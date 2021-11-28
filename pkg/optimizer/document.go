@@ -31,7 +31,7 @@ type VertexDocument struct {
 	ID Vertex `json:"_id"`
 }
 
-func ReadVertexFromVertexDocuments(p Progress, reader io.Reader, buffer, threads int) (<-chan []Vertex, <-chan error) {
+func ReadVertexFromVertexDocuments(reader io.Reader, threads int) (<-chan []Vertex, <-chan error) {
 	docs := make(chan []Vertex)
 	errs := make(chan error, 32)
 
@@ -39,7 +39,7 @@ func ReadVertexFromVertexDocuments(p Progress, reader io.Reader, buffer, threads
 		defer close(docs)
 		defer close(errs)
 
-		din, ein := ReadJSON(p, reader, buffer, threads, func(bytes []byte) (interface{}, error) {
+		din, ein := ReadJSON(reader, threads, func(bytes []byte) (interface{}, error) {
 			var v VertexDocument
 
 			if err := json.Unmarshal(bytes, &v); err != nil {
@@ -63,8 +63,6 @@ func ReadVertexFromVertexDocuments(p Progress, reader io.Reader, buffer, threads
 					q[id] = v
 				}
 			}
-
-			p.Job("READ_VERTEX_D").Add(len(q))
 
 			docs <- q
 		}

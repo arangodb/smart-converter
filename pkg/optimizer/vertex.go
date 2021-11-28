@@ -22,6 +22,7 @@ package optimizer
 
 import (
 	"io"
+	"strings"
 )
 
 type EdgeVertex struct {
@@ -30,44 +31,83 @@ type EdgeVertex struct {
 
 type Vertex string
 
-func ExtractEdgeVertexFromEdge(p Progress, in io.Reader, out io.Writer, buffer, threads int) <-chan error {
+func ExtractEdgeVertexFromEdge(in io.Reader, out io.Writer, threads int) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
-		defer p.Done()
 
-		vertexes, vertexErr := ReadEdgesFromEdgeDocuments(p, in, buffer, threads)
+		vertexes, vertexErr := ReadEdgesFromEdgeDocuments(in, threads)
 		defer PushErrors(vertexErr, errs)()
 
-		defer PushErrors(WriteEdgeVertex(p, out, vertexes), errs)()
+		nout := make(chan []EdgeVertex)
+
+		go func() {
+			defer close(nout)
+			for vertex := range vertexes {
+				q := make([]EdgeVertex, len(vertex))
+
+				RunInThread(threads, len(q), func(id int) {
+					q[id].To = RemoveCollectionNameFromVertex(vertex[id].To)
+					q[id].From = RemoveCollectionNameFromVertex(vertex[id].From)
+				})
+
+				nout <- q
+			}
+		}()
+
+		defer PushErrors(WriteEdgeVertex(out, nout), errs)()
 	}()
 	return errs
 }
 
-func ExtractVertexFromDocuments(p Progress, in io.Reader, out io.Writer, buffer, threads int) <-chan error {
+func ExtractVertexFromDocuments(in io.Reader, out io.Writer, threads int) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
-		defer p.Done()
 
-		vertexes, vertexErr := ReadVertexFromVertexDocuments(p, in, buffer, threads)
+		vertexes, vertexErr := ReadVertexFromVertexDocuments(in,  threads)
 		defer PushErrors(vertexErr, errs)()
 
-		defer PushErrors(WriteVertex(p, out, vertexes), errs)()
+		nout := make(chan []Vertex)
+
+		go func() {
+			defer close(nout)
+			for vertex := range vertexes {
+				q := make([]Vertex, len(vertex))
+
+				RunInThread(threads, len(q), func(id int) {
+					q[id] = RemoveCollectionNameFromVertex(vertex[id])
+				})
+
+				nout <- q
+			}
+		}()
+
+		defer PushErrors(WriteVertex(out, nout), errs)()
 	}()
 	return errs
 }
 
-func WriteEdgeVertex(p Progress, writer io.Writer, docs <-chan []EdgeVertex) <-chan error {
+func RemoveCollectionNameFromVertex(v Vertex) Vertex {
+	z := strings.SplitN(string(v), "/", 2)
+
+	if len(z) == 1 {
+		return Vertex(z[0])
+	}
+
+	return Vertex(z[1])
+}
+
+func WriteEdgeVertex(writer io.Writer, docs <-chan []EdgeVertex) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
 
 		data := make(chan [][]byte)
-		ein := WriteNL(p, writer, data)
+		ein := WriteNL(writer, data)
 		defer PushErrors(ein, errs)()
 
 		for in := range docs {
@@ -78,7 +118,6 @@ func WriteEdgeVertex(p Progress, writer io.Writer, docs <-chan []EdgeVertex) <-c
 				q[id*2+1] = []byte(in[id].To)
 			}
 
-			p.Job("WRITE_EDGE_VERTEX").Add(len(q))
 			data <- q
 		}
 
@@ -88,14 +127,14 @@ func WriteEdgeVertex(p Progress, writer io.Writer, docs <-chan []EdgeVertex) <-c
 	return errs
 }
 
-func WriteVertex(p Progress, writer io.Writer, docs <-chan []Vertex) <-chan error {
+func WriteVertex(writer io.Writer, docs <-chan []Vertex) <-chan error {
 	errs := make(chan error, 32)
 
 	go func() {
 		defer close(errs)
 
 		data := make(chan [][]byte)
-		ein := WriteNL(p, writer, data)
+		ein := WriteNL(writer, data)
 		defer PushErrors(ein, errs)()
 
 		for in := range docs {
@@ -105,7 +144,6 @@ func WriteVertex(p Progress, writer io.Writer, docs <-chan []Vertex) <-chan erro
 				q[id] = []byte(in[id])
 			}
 
-			p.Job("WRITE_VERTEX").Add(len(q))
 			data <- q
 		}
 
@@ -115,7 +153,7 @@ func WriteVertex(p Progress, writer io.Writer, docs <-chan []Vertex) <-chan erro
 	return errs
 }
 
-func ReadVertex(p Progress, in io.Reader, buffer int) (<-chan []Vertex, <-chan error) {
+func ReadVertex(in io.Reader) (<-chan []Vertex, <-chan error) {
 	errs := make(chan error, 32)
 	vertexes := make(chan []Vertex)
 
@@ -123,7 +161,7 @@ func ReadVertex(p Progress, in io.Reader, buffer int) (<-chan []Vertex, <-chan e
 		defer close(errs)
 		defer close(vertexes)
 
-		data, ein := ReadNL(p, in, buffer)
+		data, ein := ReadNL(in)
 		defer PushErrors(ein, errs)()
 
 		for in := range data {
@@ -133,7 +171,6 @@ func ReadVertex(p Progress, in io.Reader, buffer int) (<-chan []Vertex, <-chan e
 				q[id] = Vertex(in[id])
 			}
 
-			p.Job("READ_VERTEX").Add(len(q))
 			vertexes <- q
 		}
 	}()
