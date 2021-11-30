@@ -21,170 +21,153 @@
 package optimizer
 
 import (
-	"bufio"
 	"errors"
 	"io"
-	"sync"
 )
 
-const IOBufferSize = 64*1024
+const MaxBufferSize = 32 * 1024 * 1024
+const MaxBufferParts = MaxBufferSize / 8
 
-func ThreadChannel(size int) <-chan int {
-	c := make(chan int, size)
+type ReadHandler func(p Process, buffer []byte, parts [][]byte)
 
-	for i := 0; i < size; i++ {
-		c <- i
-	}
-
-	close(c)
-
-	return c
-}
-
-func RunInThread(threads, size int, f func(id int)) {
-	var wg sync.WaitGroup
-
-	c := ThreadChannel(size)
-
-	for i := 0; i < threads; i++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			for id := range c {
-				f(id)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-func ReadJSON(in io.Reader, threads int, parser func([]byte) (interface{}, error)) (<-chan []interface{}, <-chan error) {
-	errs := make(chan error, 32)
-	data := make(chan []interface{})
+func ReadSizeDelimit(handler Handler, in io.Reader, size int, h ReadHandler) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(errs)
-		defer close(data)
+		defer p.Done()
 
-		din, ein := ReadNL(in)
-		defer PushErrors(ein, errs)()
-
-		for arr := range din {
-			out := make([]interface{}, len(arr))
-
-			RunInThread(threads, len(arr), func(id int) {
-				v, err := parser(arr[id])
-				if err != nil {
-					errs <- err
-					return
-				}
-				out[id] = v
-			})
-
-			data <- out
-		}
-	}()
-
-	return data, errs
-}
-
-func ReadNL(in io.Reader) (<-chan [][]byte, <-chan error) {
-	errs := make(chan error, 32)
-	data := make(chan [][]byte)
-
-	go func() {
-		defer close(errs)
-		defer close(data)
-
-		scanner := bufio.NewReaderSize(in, 4*1024*1024)
-
-		datas := make([][]byte, IOBufferSize)
-		size := 0
+		delimBuff := make([][]byte, MaxBufferParts)
+		origBuff := make([]byte, MaxBufferSize)
+		offset := 0
 
 		for {
-			line, err := scanner.ReadSlice('\n')
+			n, err := in.Read(origBuff[offset:])
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
+				if !errors.Is(err, io.EOF) {
+					p.Emit(err)
+					return
 				}
-				errs <- err
+
+				// We need to push last message
+				if offset > 0 {
+					delimBuff[0] = origBuff[0:offset]
+					h(p, origBuff[0:offset], delimBuff[0:1])
+				}
+				return
+			}
+
+			buff := origBuff[:n+offset]
+			a, b := sizeDelimit(buff, delimBuff, size)
+
+			h(p, buff[:a], delimBuff[:b])
+
+			if len(buff) > a {
+				for id, b := range buff[a:] {
+					origBuff[id] = b
+				}
+				offset = len(buff) - a
+			} else {
+				offset = 0
+			}
+		}
+	}()
+
+	return p
+}
+
+func ReadL(handler Handler, in io.Reader, h ReadHandler) Process {
+	return ReadDelimit(handler, in, '\n', h)
+}
+
+func ReadDelimit(handler Handler, in io.Reader, delimitByte byte, h ReadHandler) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		delimBuff := make([][]byte, MaxBufferParts)
+		origBuff := make([]byte, MaxBufferSize)
+		offset := 0
+
+		for {
+			n, err := in.Read(origBuff[offset:])
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					p.Emit(err)
+					return
+				}
+
+				// We need to push last message
+				if offset > 0 {
+					delimBuff[0] = origBuff[0:offset]
+					h(p, origBuff[0:offset], delimBuff[0:1])
+				}
+				return
+			}
+
+			buff := origBuff[:n+offset]
+			a, b := delimit(buff, delimBuff, delimitByte)
+
+			h(p, buff[:a], delimBuff[:b])
+
+			if len(buff) > a {
+				for id, b := range buff[a:] {
+					origBuff[id] = b
+				}
+				offset = len(buff) - a
+			} else {
+				offset = 0
+			}
+		}
+	}()
+
+	return p
+}
+
+func sizeDelimit(in []byte, out [][]byte, size int) (int, int) {
+	offset := 0
+	id := size
+	last := 0
+	for {
+		if offset == len(out) || id >= len(in) {
+			return last, offset
+		}
+
+		out[offset] = in[last : last+size]
+
+		last = id
+		id += size
+		offset++
+	}
+}
+
+func delimit(in []byte, out [][]byte, delimit byte) (int, int) {
+	offset := 0
+	id := 0
+	last := 0
+	for {
+		if offset == len(out) || id >= len(in) {
+			return last, offset
+		}
+
+		if in[id] == delimit {
+			// We are on delimiter
+			if id == 0 {
+				id++
 				continue
 			}
-			l := line[0 : len(line)-1]
-			q := make([]byte, len(l))
-			copy(q, l)
-			datas[size] = q
-			size++
 
-			if size == IOBufferSize {
-				data <- datas
+			out[offset] = in[last:id]
 
-				datas = make([][]byte, IOBufferSize)
-				size = 0
+			offset++
+			id += 2
+			last = id - 1
+			if id > len(in) {
+				id = len(in)
 			}
+			continue
 		}
 
-		if size > 0 {
-			data <- datas[0:size]
-		}
-	}()
-
-	return data, errs
-}
-
-func WriteNL(out io.Writer, data <-chan [][]byte) <-chan error {
-	errs := make(chan error, 32)
-
-	go func() {
-		defer close(errs)
-
-		scanner := bufio.NewWriterSize(out, 4*1024*1024)
-
-		for in := range data {
-			for id := range in {
-				if _, err := scanner.Write(in[id]); err != nil {
-					errs <- err
-
-				}
-				if _, err := scanner.WriteString("\n"); err != nil {
-					errs <- err
-
-				}
-			}
-		}
-
-		if err := scanner.Flush(); err != nil {
-			errs <- err
-		}
-	}()
-
-	return errs
-}
-
-func Write(out io.Writer, data <-chan [][]byte) <-chan error {
-	errs := make(chan error, 32)
-
-	go func() {
-		defer close(errs)
-
-		scanner := bufio.NewWriterSize(out, 4*1024*1024)
-
-		for in := range data {
-			for id := range in {
-				if _, err := scanner.Write(in[id]); err != nil {
-					errs <- err
-
-				}
-			}
-		}
-
-		if err := scanner.Flush(); err != nil {
-			errs <- err
-		}
-	}()
-
-	return errs
+		id++
+	}
 }

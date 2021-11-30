@@ -20,22 +20,36 @@
 
 package optimizer
 
-func PushErrors(in <-chan error, out chan<- error) func() {
-	done := make(chan struct{})
+import "sync"
 
-	go func() {
-		defer close(done)
+func ThreadChannel(size int) <-chan int {
+	c := make(chan int, size)
 
-		for err := range in {
-			out <- err
-		}
-	}()
-
-	return func() {
-		if e := recover(); e != nil {
-			panic(e)
-		}
-
-		<-done
+	for i := 0; i < size; i++ {
+		c <- i
 	}
+
+	close(c)
+
+	return c
+}
+
+func RunInThread(threads, size int, f func(id int)) {
+	var wg sync.WaitGroup
+
+	c := ThreadChannel(size)
+
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for id := range c {
+				f(id)
+			}
+		}()
+	}
+
+	wg.Wait()
 }

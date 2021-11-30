@@ -21,37 +21,25 @@
 package optimizer
 
 import (
-	"encoding/json"
-	"io"
+	"bytes"
+	"testing"
 
-	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 )
 
-type EdgeDocument struct {
-	From Vertex `json:"_from"`
-	To   Vertex `json:"_to"`
-}
+func Test_Delimit(t *testing.T) {
+	t.Run("With keyword", func(t *testing.T) {
+		in := []byte("BEST\nZZZ\nu\n")
+		b := bytes.NewBuffer(in)
 
-type EdgeReadHandler func(p Process, edges []EdgeDocument)
+		h := NewHandler(log.Logger)
 
-func ReadEdge(handler Handler, in io.Reader, threads int, h EdgeReadHandler) Process {
-	p := handler.Process()
+		ReadSizeDelimit(h, b, '\n', func(p Process, buffer []byte, parts [][]byte) {
+			for _, p := range parts {
+				println(string(p))
+			}
+		})
 
-	go func() {
-		defer p.Done()
-
-		documents := make([]EdgeDocument, MaxBufferSize)
-
-		ReadL(handler, in, func(sp Process, buffer []byte, parts [][]byte) {
-			RunInThread(threads, len(parts), func(id int) {
-				if err := json.Unmarshal(parts[id], &documents[id]); err != nil {
-					p.Emit(errors.Wrapf(err, "Data (%d): %s", id, string(parts[id])))
-				}
-			})
-
-			h(p, documents[:len(parts)])
-		}).Wait()
-	}()
-
-	return p
+		h.Wait()
+	})
 }

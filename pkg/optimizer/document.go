@@ -24,49 +24,33 @@ import (
 	"encoding/json"
 	"io"
 
-	_ "github.com/mailru/easyjson/gen"
+	"github.com/pkg/errors"
 )
 
 type VertexDocument struct {
 	ID Vertex `json:"_id"`
 }
 
-func ReadVertexFromVertexDocuments(reader io.Reader, threads int) (<-chan []Vertex, <-chan error) {
-	docs := make(chan []Vertex)
-	errs := make(chan error, 32)
+type DocumentReadHandler func(p Process, documents []VertexDocument)
+
+func ReadDocument(handler Handler, in io.Reader, threads int, h DocumentReadHandler) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(docs)
-		defer close(errs)
+		defer p.Done()
 
-		din, ein := ReadJSON(reader, threads, func(bytes []byte) (interface{}, error) {
-			var v VertexDocument
+		documents := make([]VertexDocument, MaxBufferSize)
 
-			if err := json.Unmarshal(bytes, &v); err != nil {
-				return nil, err
-			}
-
-			return v.ID, nil
-		})
-
-		defer PushErrors(ein, errs)()
-
-		for d := range din {
-			q := make([]Vertex, len(d))
-
-			for id := range d {
-				if d[id] == nil {
-					continue
+		ReadL(handler, in, func(sp Process, buffer []byte, parts [][]byte) {
+			RunInThread(threads, len(parts), func(id int) {
+				if err := json.Unmarshal(parts[id], &documents[id]); err != nil {
+					p.Emit(errors.Wrapf(err, "Data (%d): %s", id, string(parts[id])))
 				}
+			})
 
-				if v, ok := d[id].(Vertex); ok {
-					q[id] = v
-				}
-			}
-
-			docs <- q
-		}
+			h(p, documents[:len(parts)])
+		}).Wait()
 	}()
 
-	return docs, errs
+	return p
 }

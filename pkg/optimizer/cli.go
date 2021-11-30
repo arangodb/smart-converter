@@ -36,7 +36,7 @@ func CLI() *cobra.Command {
 
 type cli struct {
 	threads int
-batch       int
+	batch   int
 
 	logLevel string
 
@@ -128,8 +128,8 @@ func (c *cli) Command() *cobra.Command {
 
 	f = cmd.PersistentFlags()
 
-	f.IntVar(&c.threads, "threads", 12, "Threads")
-	f.IntVar(&c.batch, "batch", 1024*1024*32, "Batch size")
+	f.IntVar(&c.threads, "threads", 32, "Threads")
+	f.IntVar(&c.batch, "batch", 1024*1024*4, "Batch size")
 	f.StringVar(&c.logLevel, "log-level", "info", "Define log level")
 
 	cmd.AddCommand(extractVertexes, extractEdges, mapEdges, optimize, translate)
@@ -165,8 +165,13 @@ func (c *cli) extractVertexes(cmd *cobra.Command, args []string) error {
 	defer outF.Close()
 
 	var failed bool
+	h := NewHandler(logger)
 
-	for err := range ExtractVertexFromDocuments(inF, outF, c.threads) {
+	ExtractVertexFromDocuments(h, inF, outF, c.threads)
+
+	go h.Wait()
+
+	for err := range h.Errors() {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to parse data")
@@ -207,8 +212,13 @@ func (c *cli) extractEdges(cmd *cobra.Command, args []string) error {
 	defer outF.Close()
 
 	var failed bool
+	h := NewHandler(logger)
 
-	for err := range ExtractEdgeVertexFromEdge(inF, outF, c.threads) {
+	ExtractEdgeVertexFromEdge(h, inF, outF, c.threads)
+
+	go h.Wait()
+
+	for err := range h.Errors() {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to parse data")
@@ -252,11 +262,23 @@ func (c *cli) mapEdges(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	for err := range MapVertexesAndEdges(inF, c.mapEdgesArgs.Edges, c.mapEdgesArgs.TempA, c.mapEdgesArgs.TempB, c.mapEdgesArgs.Out, c.batch, c.threads) {
+	h := NewHandler(logger)
+
+	MapVertexesAndEdges(h, inF, c.mapEdgesArgs.Edges, c.mapEdgesArgs.TempA, c.mapEdgesArgs.TempB, c.mapEdgesArgs.Out, c.batch, c.threads)
+
+	go h.Wait()
+
+	for err := range h.Errors() {
 		failed = true
 
 		logger.Error().Err(err).Msgf("Failed to map data")
 	}
+
+	//for err := range MapVertexesAndEdges(inF, c.mapEdgesArgs.Edges, c.mapEdgesArgs.TempA, c.mapEdgesArgs.TempB, c.mapEdgesArgs.Out, c.batch, c.threads) {
+	//	failed = true
+	//
+	//	logger.Error().Err(err).Msgf("Failed to map data")
+	//}
 
 	if failed {
 		return errors.Errorf("Data parsing failed")
@@ -294,10 +316,16 @@ func (c *cli) optimize(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	for err := range RunOptimization(inF, outF, c.batch) {
+	h := NewHandler(logger)
+
+	RunOptimization(h, inF, outF)
+
+	go h.Wait()
+
+	for err := range h.Errors() {
 		failed = true
 
-		logger.Error().Err(err).Msgf("Failed to run optimizer")
+		logger.Error().Err(err).Msgf("Failed to map data")
 	}
 
 	if failed {
@@ -376,10 +404,16 @@ func (c *cli) translate(cmd *cobra.Command, args []string) error {
 
 	var failed bool
 
-	for err := range RunTranslation(mapInF, vertexesInF, edgesInF, edgeMapIn, vertexesOutF, edgesOutF, c.threads) {
+	h := NewHandler(logger)
+
+	RunTranslation(h, mapInF, vertexesInF, edgesInF, edgeMapIn, vertexesOutF, edgesOutF, c.threads)
+
+	go h.Wait()
+
+	for err := range h.Errors() {
 		failed = true
 
-		logger.Error().Err(err).Msgf("Failed to run translator")
+		logger.Error().Err(err).Msgf("Failed to map data")
 	}
 
 	if failed {

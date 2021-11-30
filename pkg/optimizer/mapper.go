@@ -24,349 +24,277 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
-	"sync"
+	"time"
+
+	"github.com/pkg/errors"
 )
 
 type Mapping struct {
 	A, B int64
 }
 
-func RunTranslation(optimized, vertexes, edges, edgeMap io.Reader, vertexesOut, edgesOut io.Writer, threads int) <-chan error {
-	errs := make(chan error, 32)
+func RunTranslation(handler Handler, optimized, vertexes, edges, edgeMap *os.File, vertexesOut, edgesOut io.Writer, threads int) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(errs)
+		defer p.Done()
 
-		m := GetMapping(errs, optimized)
+		vertexCount := DiscoverL(handler, p, vertexes.Name(), "vertexes")
+		edgesCount := DiscoverL(handler, p, edges.Name(), "edges")
+
+		var m []Mapping
+
+		t := p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Init of weights (%d)", state, duration.String(), len(m))
+		})
+
+		ReadMapping(handler, optimized, func(mapping []Mapping) {
+			m = append(m, mapping...)
+		}).Wait()
+
+		t.Done()
+
+		RemapVertexes(handler, m, vertexes, vertexesOut, vertexCount, threads).Wait()
+		RemapEdges(handler, m, edgeMap, edges, edgesOut, edgesCount, threads).Wait()
+	}()
+
+	return p
+}
+
+func RemapEdges(handler Handler, m []Mapping, optimized, in io.Reader, out io.Writer, edgesCount, threads int) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		var edgeMap []Mapping
+
+		t := p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Init of mapping (%d)", state, duration.String(), len(m))
+		})
+
+		ReadMapping(handler, optimized, func(mapping []Mapping) {
+			edgeMap = append(edgeMap, mapping...)
+		}).Wait()
+
+		t.Done()
+
+		writter := bufio.NewWriterSize(out, MaxBufferSize)
 
 		index := 0
 
-		var wg sync.WaitGroup
+		t = p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Transforming edges (%3.4f%%)", state, duration.String(), float64(100)*(float64(index)/float64(edgesCount)))
+		})
+		defer t.Done()
 
-		wg.Add(2)
+		ReadL(handler, in, func(sp Process, buffer []byte, parts [][]byte) {
+			out := make([][]byte, len(parts))
 
-		go func() {
-			defer wg.Done()
+			RunInThread(threads, len(parts), func(id int) {
+				var q map[string]interface{}
 
-			// Lets run over vertexes
-			vertexesIn, verr := ReadNL(vertexes)
-			defer PushErrors(verr, errs)()
-
-			outData := make(chan [][]byte)
-			defer PushErrors(WriteNL(vertexesOut, outData), errs)()
-
-			for v := range vertexesIn {
-				out := make([][]byte, len(v))
-				RunInThread(threads, len(v), func(id int) {
-					var q map[string]interface{}
-
-					if err := json.Unmarshal(v[id], &q); err != nil {
-						errs <- err
-						return
-					}
-
-					key, ok := q["_key"]
-					if !ok {
-						errs <- errors.New("missing _key attribute")
-					}
-
-					q["serial_number"] = key
-
-					weight := int64(index + id)
-					if index+id < len(m) {
-						weight = m[index+id].A
-					}
-
-					q["smart"] = fmt.Sprintf("%d", weight)
-					q["_key"] = fmt.Sprintf("%d:%s", weight, key)
-
-					delete(q, "_rev")
-					delete(q, "_id")
-
-					if d, err := json.Marshal(q); err != nil {
-						errs <- err
-					} else {
-						out[id] = d
-					}
-				})
-
-				outData <- out
-				index += len(v)
-			}
-
-			close(outData)
-		}()
-
-
-		go func() {
-			defer wg.Done()
-
-			// Iterate over edges
-			eOut, eErr := ReadMapping(edgeMap)
-			PushErrors(eErr, errs)
-
-			outData := make(chan [][]byte)
-			defer PushErrors(WriteNL(edgesOut, outData), errs)()
-
-			edgesIn, verr := ReadNL(edges)
-			defer PushErrors(verr, errs)()
-
-			for v := range edgesIn {
-				edgeMap, ok := <-eOut
-				if !ok {
-					panic("")
+				if err := json.Unmarshal(parts[id], &q); err != nil {
+					p.Emit(err)
+					return
 				}
 
-				if len(v) != len(edgeMap) {
-					panic("")
+				delete(q, "_rev")
+				delete(q, "_id")
+				delete(q, "_key")
+
+				if from, ok := q["_from"]; ok {
+					if s, ok := from.(string); ok {
+						parts := strings.Split(s, "/")
+						if len(parts) == 2 {
+							q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].A].A, parts[1])
+						}
+					}
 				}
 
-				out := make([][]byte, len(v))
-				RunInThread(threads, len(v), func(id int) {
-					var q map[string]interface{}
-
-					if err := json.Unmarshal(v[id], &q); err != nil {
-						errs <- err
-						return
-					}
-					delete(q, "_rev")
-					delete(q, "_id")
-					delete(q, "_key")
-
-					if from, ok := q["_from"]; ok {
-						if s, ok := from.(string); ok {
-							parts := strings.Split(s, "/")
-							if len(parts) == 2 {
-								q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].A].A, parts[1])
-							}
+				if from, ok := q["_to"]; ok {
+					if s, ok := from.(string); ok {
+						parts := strings.Split(s, "/")
+						if len(parts) == 2 {
+							q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].B].A, parts[1])
 						}
 					}
+				}
 
-					if from, ok := q["_to"]; ok {
-						if s, ok := from.(string); ok {
-							parts := strings.Split(s, "/")
-							if len(parts) == 2 {
-								q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", m[edgeMap[id].B].A, parts[1])
-							}
-						}
-					}
+				if d, err := json.Marshal(q); err != nil {
+					p.Emit(err)
+				} else {
+					out[id] = d
+				}
+			})
 
-					if d, err := json.Marshal(q); err != nil {
-						errs <- err
-					} else {
-						out[id] = d
-					}
-				})
-				outData <- out
+			index += len(parts)
+
+			for id := range out {
+				if _, err := writter.Write(out[id]); err != nil {
+					p.Emit(err)
+				}
 			}
+		}).Wait()
 
-			close(outData)
-		}()
-
-		wg.Wait()
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
+		}
 	}()
 
-	return errs
+	return p
 }
 
-func RunOptimization(in *os.File, out io.Writer, buffer int) <-chan error {
-	errs := make(chan error, 32)
+func RemapVertexes(handler Handler, m []Mapping, in io.Reader, out io.Writer, vertexCount, threads int) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(errs)
+		defer p.Done()
 
-		m, merr := ReadMapping(in)
-		defer PushErrors(merr, errs)()
+		writter := bufio.NewWriterSize(out, MaxBufferSize)
 
-		max := int64(0)
+		index := 0
 
-		for q := range m {
-			for _, v := range q {
-				if v.A > max {
-					max = v.A
+		t := p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Transforming vertexes (%3.4f%%)", state, duration.String(), float64(100)*(float64(index)/float64(vertexCount)))
+		})
+		defer t.Done()
+
+		ReadL(handler, in, func(sp Process, buffer []byte, parts [][]byte) {
+			out := make([][]byte, len(parts))
+
+			RunInThread(threads, len(parts), func(id int) {
+				var q map[string]interface{}
+
+				if err := json.Unmarshal(parts[id], &q); err != nil {
+					p.Emit(err)
+					return
 				}
-				if v.B > max {
-					max = v.B
+
+				key, ok := q["_key"]
+				if !ok {
+					p.Emit(errors.New("missing _key attribute"))
+					return
+				}
+
+				q["serial_number"] = key
+
+				weight := int64(index + id)
+				if index+id < len(m) {
+					weight = m[index+id].A
+				}
+
+				q["smart"] = fmt.Sprintf("%d", weight)
+				q["_key"] = fmt.Sprintf("%d:%s", weight, key)
+
+				delete(q, "_rev")
+				delete(q, "_id")
+
+				if d, err := json.Marshal(q); err != nil {
+					p.Emit(err)
+				} else {
+					out[id] = d
+				}
+			})
+
+			index += len(out)
+
+			for id := range out {
+				if _, err := writter.Write(out[id]); err != nil {
+					p.Emit(err)
+				}
+				if err := writter.WriteByte('\n'); err != nil {
+					p.Emit(err)
 				}
 			}
+		}).Wait()
+
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
 		}
+	}()
+
+	return p
+}
+
+func RunOptimization(handler Handler, in *os.File, out io.Writer) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		var max int64 = 0
+		readed := 0
+
+		t := p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Init of mapped edges (%d)", state, duration.String(), readed)
+		})
+
+		ReadMapping(handler, in, func(m []Mapping) {
+			for id := range m {
+				if m[id].A > max {
+					max = m[id].A
+				}
+				if m[id].B > max {
+					max = m[id].B
+				}
+			}
+			readed += len(m)
+		}).Wait()
+
+		t.Done()
 
 		state := GenerateMapping(max + 1)
 
+		current := 0
+		iteration := 0
+
+		t = p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Running optimization - iteration %d (%3.4f%%)", state, duration.String(), iteration, float64(100)*(float64(current)/float64(readed)))
+		})
+		defer t.Done()
+
 		for {
 			if _, err := in.Seek(0, 0); err != nil {
-				errs <- err
-				break
+				p.Emit(err)
+				return
 			}
-
-			m, merr := ReadMapping(in)
-			defer PushErrors(merr, errs)()
 
 			changed := 0
 
-			println("Iteration")
+			iteration++
+			current = 0
 
-			for q := range m {
-				for _, v := range q {
-					if q := state[v.B].B; q != -1 && q != v.A {
+			ReadMapping(handler, in, func(m []Mapping) {
+				for id := range m {
+					if q := state[m[id].B].B; q != -1 && q != m[id].A {
 						continue
 					}
 
-					min := Min(state[v.A].A, state[v.B].A)
+					min := Min(state[m[id].A].A, state[m[id].B].A)
 
-					if state[v.B].A != min || state[v.A].A != min || state[v.B].B != v.A {
+					if state[m[id].B].A != min || state[m[id].A].A != min || state[m[id].B].B != m[id].A {
 						changed++
-						state[v.B].A, state[v.B].B = min, v.A
-						state[v.A].A = min
+						state[m[id].B].A, state[m[id].B].B = min, m[id].A
+						state[m[id].A].A = min
 					}
 				}
-			}
-
-			println("Iteration done", changed)
+				current += len(m)
+			}).Wait()
 
 			if changed == 0 {
 				break
 			}
 		}
 
-		data := make(chan []Mapping)
-		defer PushErrors(WriteMapping(out, data, buffer), errs)()
-
-		for id := 0; id < len(state); id += buffer {
-			if id+buffer > len(state) {
-				data <- state[id:]
-			} else {
-				data <- state[id : id+buffer]
-			}
-		}
-
-		close(data)
+		WriteMapping(handler, out, state).Wait()
 	}()
 
-	return errs
-}
-
-func GenerateMapping(size int64) []Mapping {
-	q := make([]Mapping, size)
-
-	for i := int64(0); i < size; i++ {
-		q[i].A = i
-		q[i].B = -1
-	}
-
-	return q
-}
-
-func WriteMapping(out io.Writer, in <-chan []Mapping, buffer int) <-chan error {
-	errs := make(chan error, 32)
-
-	go func() {
-		defer close(errs)
-
-		data := make(chan [][]byte, buffer)
-		defer PushErrors(Write(out, data), errs)()
-
-		for q := range in {
-			z := make([][]byte, len(q))
-
-			for id := range z {
-				i := make([]byte, 16)
-
-				binary.PutVarint(i[0:8], q[id].A)
-				binary.PutVarint(i[8:16], q[id].B)
-
-				z[id] = i
-			}
-
-			data <- z
-		}
-
-		close(data)
-
-	}()
-
-	return errs
-}
-
-func GetMapping(errs chan<- error, in io.Reader) []Mapping {
-	var m []Mapping
-
-	mc, e := ReadMapping(in)
-	defer PushErrors(e, errs)()
-
-	for q := range mc {
-		m = append(m, q...)
-	}
-
-	return m
-}
-
-func ReadMapping(in io.Reader) (<-chan []Mapping, <-chan error) {
-	errs := make(chan error, 32)
-	mappings := make(chan []Mapping)
-
-	go func() {
-		defer close(errs)
-		defer close(mappings)
-
-		scanner := bufio.NewReaderSize(in, 4*1024*1024)
-
-		m := make([]Mapping, IOBufferSize)
-		id := 0
-
-		b := make([]byte, 16)
-
-		for {
-			n, err := scanner.Read(b)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-
-				errs <- err
-				continue
-			}
-
-			if n != 16 {
-				errs <- errors.New("invalid size of read")
-				continue
-			}
-
-			if r, b := binary.Varint(b[0:8]); b == 0 {
-				errs <- errors.New("invalid size of read")
-				continue
-			} else {
-				m[id].A = r
-			}
-
-			if r, b := binary.Varint(b[8:16]); b == 0 {
-				errs <- errors.New("invalid size of read")
-				continue
-			} else {
-				m[id].B = r
-			}
-
-			id++
-
-			if id == IOBufferSize {
-				mappings <- m
-
-				m = make([]Mapping, IOBufferSize)
-				id = 0
-			}
-		}
-
-		if id > 0 {
-			mappings <- m[0:id]
-		}
-	}()
-
-	return mappings, errs
+	return p
 }
 
 func Min(x ...int64) int64 {
@@ -383,4 +311,83 @@ func Min(x ...int64) int64 {
 	}
 
 	return z
+}
+
+func ReadMapping(handler Handler, in io.Reader, mappingCallback func(m []Mapping)) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		m := make([]Mapping, MaxBufferParts)
+
+		ReadSizeDelimit(handler, in, 16, func(sp Process, buffer []byte, parts [][]byte) {
+			for id := range parts {
+				if len(parts[id]) != 16 {
+					p.Emit(errors.Errorf("Error while getting data"))
+					continue
+				}
+
+				if l, n := binary.Varint(parts[id][0:8]); n <= 0 {
+					p.Emit(errors.Errorf("Unable to read int"))
+				} else {
+					m[id].A = l
+				}
+
+				if l, n := binary.Varint(parts[id][8:16]); n <= 0 {
+					p.Emit(errors.Errorf("Unable to read int"))
+				} else {
+					m[id].B = l
+				}
+			}
+
+			mappingCallback(m[:len(parts)])
+		}).Wait()
+	}()
+
+	return p
+}
+
+func WriteMapping(handler Handler, out io.Writer, data []Mapping) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		writter := bufio.NewWriterSize(out, MaxBufferSize)
+
+		i := make([]byte, 16)
+
+		for id := range data {
+			for j := 0; j < 16; j++ {
+				i[j] = 0
+			}
+
+			binary.PutVarint(i[0:8], data[id].A)
+			binary.PutVarint(i[8:16], data[id].B)
+
+			if _, err := writter.Write(i); err != nil {
+				p.Emit(err)
+			}
+		}
+
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
+		}
+	}()
+
+	return p
+}
+
+func GenerateMapping(size int64) []Mapping {
+	part := make([]Mapping, size)
+
+	for i := int64(0); i < size; i++ {
+		part[i] = Mapping{
+			A: i,
+			B: -1,
+		}
+	}
+
+	return part
 }

@@ -21,48 +21,56 @@
 package optimizer
 
 import (
+	"bufio"
 	"encoding/binary"
-	"io"
 	"os"
 	"strconv"
+	"time"
 )
 
-func MapVertexesAndEdges(vertexes io.Reader, in, tmpA, tmpB, out string, maxSize, threads int) <-chan error {
-	errs := make(chan error)
+func MapVertexesAndEdges(handler Handler, vertexes *os.File, in, tmpA, tmpB, out string, size, threads int) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(errs)
+		defer p.Done()
 
 		last, next := in, tmpA
 
-		vertexes, verr := ReadVertex(vertexes)
-		go PushErrors(verr, errs)()
+		m := map[string]int{}
+		id := 0
+		fl := 0
+		iterations := 1
 
-		offset := 0
-		mapping := map[string]int{}
+		vertexCount := DiscoverL(handler, p, vertexes.Name(), "vertexes")
+		edgeCount := DiscoverL(handler, p, in, "edges")
 
-		for {
-			vtx, ok := <-vertexes
-			if !ok {
-				if len(mapping)==0 {
-					break
-				}
+		edgeCurrent := 0
+
+		t := p.Task(5*time.Second, func(state string, duration time.Duration) {
+			if edgeCurrent == edgeCount || edgeCurrent == 0 {
+				WithMemory(p.Info()).Msgf("%s (%s): Mapping of vertexes & edges (%3.4f%%) - create key mapping (%3.4f%%)", state, duration.String(), float64(100)*(float64(id)/float64(vertexCount)), float64(100)*(float64(fl)/float64(size)))
+			} else {
+				WithMemory(p.Info()).Msgf("%s (%s): Mapping of vertexes & edges (%3.4f%%) - iteration %d (%3.4f%%)", state, duration.String(), float64(100)*(float64(id)/float64(vertexCount)), iterations, float64(100)*(float64(edgeCurrent)/float64(edgeCount)))
+			}
+		})
+
+		defer t.Done()
+
+		ReadL(handler, vertexes, func(p Process, buffer []byte, parts [][]byte) {
+			for q := range parts {
+				m[string(parts[q])] = id + q
 			}
 
-			if ok {
-				for id := range vtx {
-					mapping[string(vtx[id])] = id + offset
-				}
+			id += len(parts)
+			fl += len(parts)
 
-				offset += len(vtx)
-			}
+			if fl >= size {
+				fl = 0
 
-			if len(mapping) > maxSize || !ok {
-				if err := mapVertexesBatch(errs, mapping, last, next, threads); err != nil {
-					errs <- err
-				}
-
-				mapping = map[string]int{}
+				edgeCurrent = 0
+				mapVertexesBatch(handler, m, last, next, &edgeCurrent, threads).Wait()
+				iterations++
+				m = map[string]int{}
 
 				if next == tmpA {
 					last, next = tmpA, tmpB
@@ -70,104 +78,138 @@ func MapVertexesAndEdges(vertexes io.Reader, in, tmpA, tmpB, out string, maxSize
 					last, next = tmpB, tmpA
 				}
 			}
+		}).Wait()
+
+		if fl > 0 {
+			edgeCurrent = 0
+			mapVertexesBatch(handler, m, last, next, &edgeCurrent, threads).Wait()
+
+			if next == tmpA {
+				last, next = tmpA, tmpB
+			} else {
+				last, next = tmpB, tmpA
+			}
 		}
 
-		if err := mapEdgesToInt(errs, last, out); err != nil {
-			errs <- err
+		mapEdgesToInt(handler, last, out).Wait()
+	}()
+
+	return p
+}
+
+func mapVertexesBatch(handler Handler, s map[string]int, in, out string, edgeCurrent *int, threads int) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		fin, err := os.OpenFile(in, os.O_RDONLY, 0644)
+		if err != nil {
+			p.Emit(err)
+			return
+		}
+
+		defer fin.Close()
+
+		fout, err := os.OpenFile(out, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			p.Emit(err)
+			return
+		}
+
+		defer fout.Close()
+
+		writter := bufio.NewWriterSize(fout, MaxBufferSize)
+
+		ReadL(handler, fin, func(sp Process, buffer []byte, parts [][]byte) {
+			np := make([][]byte, len(parts))
+			RunInThread(threads, len(parts), func(id int) {
+				np[id] = parts[id]
+				if len(parts[id]) == 0 {
+					return
+				}
+
+				if parts[id][0] == 0 {
+					return
+				}
+
+				if z, ok := s[string(parts[id])]; ok {
+					np[id] = append([]byte{0}, strconv.Itoa(z)...)
+					return
+				}
+			})
+			for id := range np {
+				if _, err := writter.Write(np[id]); err != nil {
+					p.Emit(err)
+				}
+				if err := writter.WriteByte('\n'); err != nil {
+					p.Emit(err)
+				}
+			}
+			*edgeCurrent += len(parts)
+		}).Wait()
+
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
 		}
 	}()
 
-	return errs
+	return p
 }
 
-func mapVertexesBatch(errs chan<- error, s map[string]int, in, out string, threads int) error {
-	fin, err := os.OpenFile(in, os.O_RDONLY, 0644)
-	if err != nil {
-		return err
-	}
+func mapEdgesToInt(handler Handler, in, out string) Process {
+	p := handler.Process()
 
-	defer fin.Close()
+	go func() {
+		defer p.Done()
 
-	fout, err := os.OpenFile(out, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-
-	defer fout.Close()
-
-	din, derr := ReadNL(fin)
-	defer PushErrors(derr, errs)()
-
-	dout := make(chan [][]byte, 4)
-	defer PushErrors(WriteNL(fout, dout), errs)()
-
-	for d := range din {
-		r := make([][]byte, len(d))
-		RunInThread(threads, len(d), func(id int) {
-			r[id] = d[id]
-
-			if len(d[id]) == 0 {
-				return
-			}
-
-			if d[id][0] == 0 {
-				return
-			}
-
-			if z, ok := s[string(d[id])]; ok {
-				r[id] = append([]byte{0}, strconv.Itoa(z)...)
-				return
-			}
-		})
-		dout <- r
-	}
-
-	close(dout)
-
-	return nil
-}
-
-func mapEdgesToInt(errs chan<- error, in, out string) error {
-	fin, err := os.OpenFile(in, os.O_RDONLY, 0644)
-	if err != nil {
-		return err
-	}
-
-	defer fin.Close()
-
-	fout, err := os.OpenFile(out, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-
-	defer fout.Close()
-
-	din, derr := ReadNL(fin)
-	defer PushErrors(derr, errs)()
-
-	dout := make(chan [][]byte)
-	defer PushErrors(Write(fout, dout), errs)()
-
-	for d := range din {
-		r := make([][]byte, len(d))
-
-		for id := range d {
-			n, err := strconv.Atoi(string(d[id][1:]))
-			if err != nil {
-				errs <- err
-			}
-
-			e := make([]byte, 8)
-
-			binary.PutVarint(e, int64(n))
-
-			r[id] = e
+		fin, err := os.OpenFile(in, os.O_RDONLY, 0644)
+		if err != nil {
+			p.Emit(err)
+			return
 		}
 
-		dout <- r
-	}
+		defer p.DeferEmit(fin.Close)
 
-	close(dout)
+		fout, err := os.OpenFile(out, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			p.Emit(err)
+			return
+		}
 
-	return nil
+		defer p.DeferEmit(fout.Close)
+
+		writter := bufio.NewWriterSize(fout, MaxBufferSize)
+
+		e := make([]byte, 8)
+
+		ids := 0
+
+		ReadL(handler, fin, func(sp Process, buffer []byte, parts [][]byte) {
+			for id := range parts {
+				ids++
+				n, err := strconv.Atoi(string(parts[id][1:]))
+				if err != nil {
+					p.Emit(err)
+					return
+				}
+
+				for id := 0; id < 8; id++ {
+					e[id] = 0
+				}
+
+				binary.PutVarint(e, int64(n))
+
+				if _, err := writter.Write(e); err != nil {
+					p.Emit(err)
+				}
+			}
+		}).Wait()
+
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
+		}
+	}()
+
+	return p
 }

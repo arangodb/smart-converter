@@ -21,159 +21,103 @@
 package optimizer
 
 import (
+	"bufio"
 	"io"
+	"os"
 	"strings"
+	"time"
 )
-
-type EdgeVertex struct {
-	From, To Vertex
-}
 
 type Vertex string
 
-func ExtractEdgeVertexFromEdge(in io.Reader, out io.Writer, threads int) <-chan error {
-	errs := make(chan error, 32)
-
-	go func() {
-		defer close(errs)
-
-		vertexes, vertexErr := ReadEdgesFromEdgeDocuments(in, threads)
-		defer PushErrors(vertexErr, errs)()
-
-		nout := make(chan []EdgeVertex)
-
-		go func() {
-			defer close(nout)
-			for vertex := range vertexes {
-				q := make([]EdgeVertex, len(vertex))
-
-				RunInThread(threads, len(q), func(id int) {
-					q[id].To = RemoveCollectionNameFromVertex(vertex[id].To)
-					q[id].From = RemoveCollectionNameFromVertex(vertex[id].From)
-				})
-
-				nout <- q
-			}
-		}()
-
-		defer PushErrors(WriteEdgeVertex(out, nout), errs)()
-	}()
-	return errs
-}
-
-func ExtractVertexFromDocuments(in io.Reader, out io.Writer, threads int) <-chan error {
-	errs := make(chan error, 32)
-
-	go func() {
-		defer close(errs)
-
-		vertexes, vertexErr := ReadVertexFromVertexDocuments(in,  threads)
-		defer PushErrors(vertexErr, errs)()
-
-		nout := make(chan []Vertex)
-
-		go func() {
-			defer close(nout)
-			for vertex := range vertexes {
-				q := make([]Vertex, len(vertex))
-
-				RunInThread(threads, len(q), func(id int) {
-					q[id] = RemoveCollectionNameFromVertex(vertex[id])
-				})
-
-				nout <- q
-			}
-		}()
-
-		defer PushErrors(WriteVertex(out, nout), errs)()
-	}()
-	return errs
-}
-
-func RemoveCollectionNameFromVertex(v Vertex) Vertex {
+func (v Vertex) ID() string {
 	z := strings.SplitN(string(v), "/", 2)
 
 	if len(z) == 1 {
-		return Vertex(z[0])
+		return z[0]
 	}
 
-	return Vertex(z[1])
+	return z[1]
 }
 
-func WriteEdgeVertex(writer io.Writer, docs <-chan []EdgeVertex) <-chan error {
-	errs := make(chan error, 32)
+func ExtractEdgeVertexFromEdge(handler Handler, in *os.File, out io.Writer, threads int) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(errs)
+		defer p.Done()
 
-		data := make(chan [][]byte)
-		ein := WriteNL(writer, data)
-		defer PushErrors(ein, errs)()
+		count := DiscoverL(handler, p, in.Name(), "edges")
 
-		for in := range docs {
-			q := make([][]byte, len(in)*2)
+		current := 0
 
-			for id := range in {
-				q[id*2] = []byte(in[id].From)
-				q[id*2+1] = []byte(in[id].To)
+		t := p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Translating edges (%3.4f%%)", state, duration.String(), float64(100)*(float64(current)/float64(count)))
+		})
+
+		writter := bufio.NewWriterSize(out, MaxBufferSize)
+
+		ReadEdge(handler, in, threads, func(sp Process, documents []EdgeDocument) {
+			for id := range documents {
+				if _, err := writter.WriteString(documents[id].From.ID()); err != nil {
+					p.Emit(err)
+				}
+				if err := writter.WriteByte('\n'); err != nil {
+					p.Emit(err)
+				}
+				if _, err := writter.WriteString(documents[id].To.ID()); err != nil {
+					p.Emit(err)
+				}
+				if err := writter.WriteByte('\n'); err != nil {
+					p.Emit(err)
+				}
 			}
+			current += len(documents)
+		}).Wait()
 
-			data <- q
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
 		}
 
-		close(data)
+		t.Done()
 	}()
 
-	return errs
+	return p
 }
 
-func WriteVertex(writer io.Writer, docs <-chan []Vertex) <-chan error {
-	errs := make(chan error, 32)
+func ExtractVertexFromDocuments(handler Handler, in *os.File, out io.Writer, threads int) Process {
+	p := handler.Process()
 
 	go func() {
-		defer close(errs)
+		defer p.Done()
 
-		data := make(chan [][]byte)
-		ein := WriteNL(writer, data)
-		defer PushErrors(ein, errs)()
+		count := DiscoverL(handler, p, in.Name(), "vertexes")
 
-		for in := range docs {
-			q := make([][]byte, len(in))
+		writter := bufio.NewWriterSize(out, MaxBufferSize)
 
-			for id := range in {
-				q[id] = []byte(in[id])
+		current := 0
+
+		t := p.Task(time.Second, func(state string, duration time.Duration) {
+			WithMemory(p.Info()).Msgf("%s (%s): Translating vertexes (%3.4f%%)", state, duration.String(), float64(100)*(float64(current)/float64(count)))
+		})
+
+		ReadDocument(handler, in, threads, func(sp Process, documents []VertexDocument) {
+			for id := range documents {
+				if _, err := writter.WriteString(documents[id].ID.ID()); err != nil {
+					p.Emit(err)
+				}
+				if err := writter.WriteByte('\n'); err != nil {
+					p.Emit(err)
+				}
 			}
+			current += len(documents)
+		}).Wait()
 
-			data <- q
+		if err := writter.Flush(); err != nil {
+			p.Emit(err)
 		}
 
-		close(data)
+		t.Done()
 	}()
 
-	return errs
-}
-
-func ReadVertex(in io.Reader) (<-chan []Vertex, <-chan error) {
-	errs := make(chan error, 32)
-	vertexes := make(chan []Vertex)
-
-	go func() {
-		defer close(errs)
-		defer close(vertexes)
-
-		data, ein := ReadNL(in)
-		defer PushErrors(ein, errs)()
-
-		for in := range data {
-			q := make([]Vertex, len(in))
-
-			for id := range in {
-				q[id] = Vertex(in[id])
-			}
-
-			vertexes <- q
-		}
-	}()
-
-	return vertexes, errs
+	return p
 }
