@@ -38,7 +38,25 @@ type Mapping struct {
 	A, B int64
 }
 
-func RunTranslation(handler Handler, optimized, vertexes, edges, edgeMap *os.File, vertexesOut, edgesOut io.Writer, threads int) Process {
+func RunVertexTranslation(handler Handler, optimized, vertexes *os.File, vertexesOut io.Writer, threads int) Process {
+	p := handler.Process()
+
+	go func() {
+		defer p.Done()
+
+		vertexCount := DiscoverL(handler, p, vertexes.Name(), "vertexes")
+
+		weights := GetWeights(handler, p, optimized, vertexCount)
+
+		runtime.GC()
+
+		RemapVertexes(handler, weights, vertexes, vertexesOut, vertexCount, threads).Wait()
+	}()
+
+	return p
+}
+
+func RunEdgesTranslation(handler Handler, optimized, vertexes, edges, edgeMap *os.File, edgesOut io.Writer, threads int) Process {
 	p := handler.Process()
 
 	go func() {
@@ -47,64 +65,71 @@ func RunTranslation(handler Handler, optimized, vertexes, edges, edgeMap *os.Fil
 		vertexCount := DiscoverL(handler, p, vertexes.Name(), "vertexes")
 		edgesCount := DiscoverL(handler, p, edges.Name(), "edges")
 
-		m := make([]int64, vertexCount*2)
-		index := 0
-
-		t := p.Task(time.Second, func(state string, duration time.Duration) {
-			WithMemory(p.Info()).Msgf("%s (%s): Init of weights (%d)", state, duration.String(), len(m))
-		})
-		ReadMapping(handler, optimized, func(mapping []Mapping) {
-			for mid := range mapping {
-				m[index] = mapping[mid].A
-				m[index+1] = mapping[mid].B
-				index += 2
-			}
-		}).Wait()
-
-		t.Done()
+		mapping := GetEdgeWeights(handler, p, optimized, edgeMap, vertexCount, edgesCount)
 
 		runtime.GC()
 
-		RemapVertexes(handler, m, vertexes, vertexesOut, vertexCount, threads).Wait()
-
-		runtime.GC()
-
-		RemapEdges(handler, m, edgeMap, edges, edgesOut, edgesCount, threads).Wait()
+		RemapEdges(handler, mapping, edges, edgesOut, edgesCount, threads).Wait()
 	}()
 
 	return p
 }
 
-func RemapEdges(handler Handler, m []int64, optimized, in io.Reader, out io.Writer, edgesCount, threads int) Process {
+func GetEdgeWeights(handler Handler, process ProcessInt, mapping, edges io.Reader, vertexCount, edgesCount int) []Mapping {
+	weights := GetWeights(handler, process, mapping, vertexCount)
+
+	edgeMap := make([]Mapping, edgesCount)
+	index := 0
+
+	t := process.Task(time.Second, func(state string, duration time.Duration) {
+		WithMemory(process.Info()).Msgf("%s (%s): Init of mapping (%d)", state, duration.String(), len(edgeMap))
+	})
+	defer t.Done()
+
+	ReadMapping(handler, edges, func(mapping []Mapping) {
+		for mid := range mapping {
+			edgeMap[index+mid].A = weights[mapping[mid].A]
+			edgeMap[index+mid].B = weights[mapping[mid].B]
+		}
+		index += len(mapping)
+	}).Wait()
+
+	defer runtime.GC()
+
+	return edgeMap
+}
+
+func GetWeights(handler Handler, process ProcessInt, mapping io.Reader, vertexCount int) []int64 {
+	m := make([]int64, vertexCount)
+	index := 0
+
+	t := process.Task(time.Second, func(state string, duration time.Duration) {
+		WithMemory(process.Info()).Msgf("%s (%s): Init of weights (%d)", state, duration.String(), len(m))
+	})
+	defer t.Done()
+	ReadMapping(handler, mapping, func(mapping []Mapping) {
+		for mid := range mapping {
+			m[index+mid] = mapping[mid].A
+		}
+		index += len(mapping)
+	}).Wait()
+
+	defer runtime.GC()
+
+	return m
+}
+
+func RemapEdges(handler Handler, edgeWeights []Mapping, in io.Reader, out io.Writer, edgesCount, threads int) Process {
 	p := handler.Process()
 
 	go func() {
 		defer p.Done()
 
-		edgeMap := make([]int64, edgesCount*2)
+		writter := bufio.NewWriterSize(out, MaxBufferSize)
+
 		index := 0
 
 		t := p.Task(time.Second, func(state string, duration time.Duration) {
-			WithMemory(p.Info()).Msgf("%s (%s): Init of mapping (%d)", state, duration.String(), len(m))
-		})
-
-		ReadMapping(handler, optimized, func(mapping []Mapping) {
-			for mid := range mapping {
-				edgeMap[index] = mapping[mid].A
-				edgeMap[index+1] = mapping[mid].B
-				index += 2
-			}
-		}).Wait()
-
-		t.Done()
-
-		runtime.GC()
-
-		writter := bufio.NewWriterSize(out, MaxBufferSize)
-
-		index = 0
-
-		t = p.Task(time.Second, func(state string, duration time.Duration) {
 			WithMemory(p.Info()).Msgf("%s (%s): Transforming edges (%3.4f%%)", state, duration.String(), float64(100)*(float64(index)/float64(edgesCount)))
 		})
 		defer t.Done()
@@ -128,7 +153,7 @@ func RemapEdges(handler Handler, m []int64, optimized, in io.Reader, out io.Writ
 					if s, ok := from.(string); ok {
 						parts := strings.Split(s, "/")
 						if len(parts) == 2 {
-							q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", m[(edgeMap[id*2]*2)], parts[1])
+							q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", edgeWeights[id].A, parts[1])
 						}
 					}
 				}
@@ -137,7 +162,7 @@ func RemapEdges(handler Handler, m []int64, optimized, in io.Reader, out io.Writ
 					if s, ok := from.(string); ok {
 						parts := strings.Split(s, "/")
 						if len(parts) == 2 {
-							q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", m[(edgeMap[id*2+1])*2], parts[1])
+							q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", edgeWeights[id].B, parts[1])
 						}
 					}
 				}
@@ -153,6 +178,9 @@ func RemapEdges(handler Handler, m []int64, optimized, in io.Reader, out io.Writ
 
 			for id := range out {
 				if _, err := writter.Write(out[id]); err != nil {
+					p.Emit(err)
+				}
+				if err := writter.WriteByte('\n'); err != nil {
 					p.Emit(err)
 				}
 			}
@@ -202,7 +230,7 @@ func RemapVertexes(handler Handler, m []int64, in io.Reader, out io.Writer, vert
 
 				weight := int64(index + id)
 				if index+id < len(m) {
-					weight = m[(index+id)*2]
+					weight = m[index+id]
 				}
 
 				q["smart"] = fmt.Sprintf("%d", weight)

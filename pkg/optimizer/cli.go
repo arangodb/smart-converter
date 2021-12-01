@@ -89,9 +89,19 @@ func (c *cli) Command() *cobra.Command {
 	}
 
 	translate := &cobra.Command{
-		Use:     "translate",
-		RunE:    c.translate,
-		PreRunE: c.translatePre,
+		Use: "translate",
+	}
+
+	translateVertex := &cobra.Command{
+		Use:     "vertex",
+		RunE:    c.translateVertex,
+		PreRunE: c.translateVertexPre,
+	}
+
+	translateEdge := &cobra.Command{
+		Use:     "edge",
+		RunE:    c.translateEdge,
+		PreRunE: c.translateEdgePre,
 	}
 
 	f := extractVertexes.Flags()
@@ -117,11 +127,15 @@ func (c *cli) Command() *cobra.Command {
 	f.StringVar(&c.optimizeArgs.In, "in", "", "File with input edges")
 	f.StringVar(&c.optimizeArgs.Out, "out", "", "File with output edges vertexes")
 
-	f = translate.Flags()
+	f = translate.PersistentFlags()
 
 	f.StringVar(&c.translateArgs.Map, "map", "", "File with optimized map")
 	f.StringVar(&c.translateArgs.Vertexes, "vertexes", "", "File with vertexes")
+
+	f = translateVertex.Flags()
 	f.StringVar(&c.translateArgs.VertexesOut, "vertexes-out", "", "File with vertexes result")
+
+	f = translateEdge.Flags()
 	f.StringVar(&c.translateArgs.Edges, "edges", "", "File with edges")
 	f.StringVar(&c.translateArgs.EdgesOut, "edges-out", "", "File with edges out")
 	f.StringVar(&c.translateArgs.EdgesMap, "edge-map", "", "File with edge map")
@@ -132,6 +146,7 @@ func (c *cli) Command() *cobra.Command {
 	f.IntVar(&c.batch, "batch", 1024*1024*4, "Batch size")
 	f.StringVar(&c.logLevel, "log-level", "info", "Define log level")
 
+	translate.AddCommand(translateEdge, translateVertex)
 	cmd.AddCommand(extractVertexes, extractEdges, mapEdges, optimize, translate)
 
 	return cmd
@@ -274,12 +289,6 @@ func (c *cli) mapEdges(cmd *cobra.Command, args []string) error {
 		logger.Error().Err(err).Msgf("Failed to map data")
 	}
 
-	//for err := range MapVertexesAndEdges(inF, c.mapEdgesArgs.Edges, c.mapEdgesArgs.TempA, c.mapEdgesArgs.TempB, c.mapEdgesArgs.Out, c.batch, c.threads) {
-	//	failed = true
-	//
-	//	logger.Error().Err(err).Msgf("Failed to map data")
-	//}
-
 	if failed {
 		return errors.Errorf("Data parsing failed")
 	}
@@ -335,7 +344,7 @@ func (c *cli) optimize(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func (c *cli) translatePre(cmd *cobra.Command, args []string) error {
+func (c *cli) translateVertexPre(cmd *cobra.Command, args []string) error {
 	if err := c.markAsRequired(c.translateArgs.Map != "", "--map parameter is not set"); err != nil {
 		return err
 	}
@@ -345,19 +354,10 @@ func (c *cli) translatePre(cmd *cobra.Command, args []string) error {
 	if err := c.markAsRequired(c.translateArgs.VertexesOut != "", "--vertexes-out parameter is not set"); err != nil {
 		return err
 	}
-	if err := c.markAsRequired(c.translateArgs.Edges != "", "--edges parameter is not set"); err != nil {
-		return err
-	}
-	if err := c.markAsRequired(c.translateArgs.EdgesOut != "", "--edges-out parameter is not set"); err != nil {
-		return err
-	}
-	if err := c.markAsRequired(c.translateArgs.EdgesMap != "", "--edge-map parameter is not set"); err != nil {
-		return err
-	}
 	return nil
 }
 
-func (c *cli) translate(cmd *cobra.Command, args []string) error {
+func (c *cli) translateVertex(cmd *cobra.Command, args []string) error {
 	logger := c.getLogger(cmd)
 
 	mapInF, err := os.OpenFile(c.translateArgs.Map, os.O_RDONLY, 0644)
@@ -380,6 +380,64 @@ func (c *cli) translate(cmd *cobra.Command, args []string) error {
 	}
 
 	defer vertexesOutF.Close()
+
+	var failed bool
+
+	h := NewHandler(logger)
+
+	RunVertexTranslation(h, mapInF, vertexesInF, vertexesOutF, c.threads)
+
+	go h.Wait()
+
+	for err := range h.Errors() {
+		failed = true
+
+		logger.Error().Err(err).Msgf("Failed to map vertex")
+	}
+
+	if failed {
+		return errors.Errorf("Data parsing failed")
+	}
+
+	return nil
+}
+
+func (c *cli) translateEdgePre(cmd *cobra.Command, args []string) error {
+	if err := c.markAsRequired(c.translateArgs.Map != "", "--map parameter is not set"); err != nil {
+		return err
+	}
+	if err := c.markAsRequired(c.translateArgs.Vertexes != "", "--vertexes parameter is not set"); err != nil {
+		return err
+	}
+
+	if err := c.markAsRequired(c.translateArgs.Edges != "", "--edges parameter is not set"); err != nil {
+		return err
+	}
+	if err := c.markAsRequired(c.translateArgs.EdgesOut != "", "--edges-out parameter is not set"); err != nil {
+		return err
+	}
+	if err := c.markAsRequired(c.translateArgs.EdgesMap != "", "--edge-map parameter is not set"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *cli) translateEdge(cmd *cobra.Command, args []string) error {
+	logger := c.getLogger(cmd)
+
+	mapInF, err := os.OpenFile(c.translateArgs.Map, os.O_RDONLY, 0644)
+	if err != nil {
+		return err
+	}
+
+	defer mapInF.Close()
+
+	vertexesInF, err := os.OpenFile(c.translateArgs.Vertexes, os.O_RDONLY, 0644)
+	if err != nil {
+		return err
+	}
+
+	defer vertexesInF.Close()
 
 	edgesOutF, err := os.OpenFile(c.translateArgs.EdgesOut, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
@@ -406,7 +464,7 @@ func (c *cli) translate(cmd *cobra.Command, args []string) error {
 
 	h := NewHandler(logger)
 
-	RunTranslation(h, mapInF, vertexesInF, edgesInF, edgeMapIn, vertexesOutF, edgesOutF, c.threads)
+	RunEdgesTranslation(h, mapInF, vertexesInF, edgesInF, edgeMapIn, edgesOutF, c.threads)
 
 	go h.Wait()
 

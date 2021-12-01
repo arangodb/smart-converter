@@ -37,9 +37,9 @@ func Test_Run(t *testing.T) {
 	})
 
 	t.Run("Execute", func(t *testing.T) {
-		//runExecution(t, "T1")
-		//runExecution(t, "T2")
-		//runExecution(t, "T3")
+		runExecution(t, "T1")
+		runExecution(t, "T2")
+		runExecution(t, "T3")
 		runExecution(t, "T4")
 	})
 }
@@ -77,7 +77,12 @@ func runExecution(t *testing.T, id string) {
 			})
 
 			t.Run("Translate", func(t *testing.T) {
-				executeCommand(t, "translate", "--map", edgeIntOpt, "--vertexes", docFile, "--edges", edgeFile, "--edge-map", edgeIntOut, "--vertexes-out", docFileOut, "--edges-out", edgeFileOut)
+				t.Run("Vertexes", func(t *testing.T) {
+					executeCommand(t, "translate", "vertex", "--map", edgeIntOpt, "--vertexes", docFile, "--vertexes-out", docFileOut)
+				})
+				t.Run("Edges", func(t *testing.T) {
+					executeCommand(t, "translate", "edge", "--map", edgeIntOpt, "--vertexes", docFile, "--edges", edgeFile, "--edge-map", edgeIntOut, "--edges-out", edgeFileOut)
+				})
 			})
 		})
 	})
