@@ -22,6 +22,7 @@ package optimizer
 
 import (
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -224,6 +225,8 @@ func DiscoverL(h Handler, p ProcessInt, file, name string) int {
 	ReadL(h, r, func(p Process, buffer []byte, parts [][]byte) {
 		current += len(parts)
 	}).Wait()
+
+	runtime.GC()
 
 	return current
 }

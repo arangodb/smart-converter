@@ -34,10 +34,14 @@ func GetMemStats() runtime.MemStats {
 }
 
 func WithMemory(event *zerolog.Event) *zerolog.Event {
-	return event.Str("memory", CurrentMemory())
+	return event.Str("sys", SysMemory()).Str("alloc", AllocMemory())
 }
 
-func CurrentMemory() string {
+func AllocMemory() string {
+	return MemoryToString(GetMemStats().Alloc)
+}
+
+func SysMemory() string {
 	return MemoryToString(GetMemStats().Sys)
 }
 

@@ -24,6 +24,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 )
@@ -77,6 +78,8 @@ func MapVertexesAndEdges(handler Handler, vertexes *os.File, in, tmpA, tmpB, out
 				} else {
 					last, next = tmpB, tmpA
 				}
+
+				runtime.GC()
 			}
 		}).Wait()
 

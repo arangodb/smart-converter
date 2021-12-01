@@ -33,14 +33,14 @@ func Test_Run(t *testing.T) {
 		ensureTestCase(t, "T1", 64, 128, "colA", "edgeA")
 		ensureTestCase(t, "T2", 1024*128, 1024*128*2, "colA", "edgeA")
 		ensureTestCase(t, "T3", 1024*1024, 1024*1024*2, "colA", "edgeA")
-		//ensureTestCase(t, "T4", 16*1024*1024, 8*1024*1024, "colA", "edgeA")
+		ensureTestCase(t, "T4", 16*1024*1024, 8*1024*1024, "colA", "edgeA")
 	})
 
 	t.Run("Execute", func(t *testing.T) {
-		runExecution(t, "T1")
-		runExecution(t, "T2")
-		runExecution(t, "T3")
-		//runExecution(t, "T4")
+		//runExecution(t, "T1")
+		//runExecution(t, "T2")
+		//runExecution(t, "T3")
+		runExecution(t, "T4")
 	})
 }
 
