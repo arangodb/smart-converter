@@ -153,7 +153,7 @@ func RemapEdges(handler Handler, edgeWeights []Mapping, in io.Reader, out io.Wri
 					if s, ok := from.(string); ok {
 						parts := strings.Split(s, "/")
 						if len(parts) == 2 {
-							q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", edgeWeights[id].A, parts[1])
+							q["_from"] = fmt.Sprintf("%s/%d:%s", "entities2", edgeWeights[index+id].A, parts[1])
 						}
 					}
 				}
@@ -162,7 +162,7 @@ func RemapEdges(handler Handler, edgeWeights []Mapping, in io.Reader, out io.Wri
 					if s, ok := from.(string); ok {
 						parts := strings.Split(s, "/")
 						if len(parts) == 2 {
-							q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", edgeWeights[id].B, parts[1])
+							q["_to"] = fmt.Sprintf("%s/%d:%s", "entities2", edgeWeights[index+id].B, parts[1])
 						}
 					}
 				}

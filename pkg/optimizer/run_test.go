@@ -37,9 +37,9 @@ func Test_Run(t *testing.T) {
 	})
 
 	t.Run("Execute", func(t *testing.T) {
-		runExecution(t, "T1")
-		runExecution(t, "T2")
-		runExecution(t, "T3")
+		//runExecution(t, "T1")
+		//runExecution(t, "T2")
+		//runExecution(t, "T3")
 		runExecution(t, "T4")
 	})
 }
@@ -61,18 +61,22 @@ func runExecution(t *testing.T, id string) {
 
 		t.Run("TESTING", func(t *testing.T) {
 			t.Run("Extract vertexes", func(t *testing.T) {
+				t.Skip()
 				executeCommand(t, "extract-vertexes", "--in", docFile, "--out", vertexesFile)
 			})
 
 			t.Run("Extract edges", func(t *testing.T) {
+				t.Skip()
 				executeCommand(t, "extract-edges", "--in", edgeFile, "--out", edgeVertexesFile)
 			})
 
 			t.Run("Map edges", func(t *testing.T) {
+				t.Skip()
 				executeCommand(t, "map-edges", "--vertexes", vertexesFile, "--edges", edgeVertexesFile, "--temp.a", edgeVertexesTempA, "--temp.b", edgeVertexesTempB, "--out", edgeIntOut)
 			})
 
 			t.Run("Optimize", func(t *testing.T) {
+				t.Skip()
 				executeCommand(t, "optimize", "--in", edgeIntOut, "--out", edgeIntOpt)
 			})
 
